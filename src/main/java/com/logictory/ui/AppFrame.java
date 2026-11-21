@@ -2,6 +2,7 @@ package com.logictory.ui;
 
 import com.logictory.auth.UserSession;
 import com.logictory.ui.freeplay.FreeplayPanel;
+import com.logictory.ui.freeplay.SchematicsDialog;
 
 import javax.swing.JFrame;
 import javax.swing.JPanel;
@@ -18,10 +19,12 @@ public final class AppFrame extends JFrame {
     private final CardLayout cards = new CardLayout();
     private final JPanel root = new JPanel(cards);
     private final FreeplayPanel freeplay;
+    private UserSession session;
     private boolean freeplayShown;
 
     public AppFrame(UserSession session) {
         super("Logictory - Main Menu");
+        this.session = session;
         setDefaultCloseOperation(EXIT_ON_CLOSE);
         Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
         setSize(Math.min(1180, Math.max(760, screen.width - 100)),
@@ -29,8 +32,10 @@ public final class AppFrame extends JFrame {
         setMinimumSize(new Dimension(760, 520));
         setLocationRelativeTo(null);
 
-        MainMenuPanel menu = new MainMenuPanel(session, this::showFreeplay);
-        freeplay = new FreeplayPanel(this::showMenu);
+        MainMenuPanel menu = new MainMenuPanel(session, this::showFreeplay, this::setSession,
+                () -> showFreeplay(SchematicsDialog.SAVED_TAB),
+                () -> showFreeplay(SchematicsDialog.ONLINE_TAB));
+        freeplay = new FreeplayPanel(this::showMenu, () -> this.session);
 
         root.add(menu, MENU);
         root.add(freeplay, FREEPLAY);
@@ -38,17 +43,35 @@ public final class AppFrame extends JFrame {
         showMenu();
     }
 
+    private void setSession(UserSession session) {
+        this.session = session;
+    }
+
     public void showMenu() {
         setTitle("Logictory - Main Menu");
+        setJMenuBar(null);
         cards.show(root, MENU);
     }
 
     public void showFreeplay() {
+        showFreeplay(-1);
+    }
+
+    /** Switches to the board and optionally opens the schematics browser on a tab. */
+    private void showFreeplay(int schematicsTab) {
         setTitle("Logictory - Freeplay");
+        setJMenuBar(freeplay.menuBar());
         cards.show(root, FREEPLAY);
-        if (!freeplayShown) {
-            freeplayShown = true;
-            SwingUtilities.invokeLater(freeplay::fitView);
-        }
+        boolean firstShow = !freeplayShown;
+        freeplayShown = true;
+        SwingUtilities.invokeLater(() -> {
+            if (firstShow) {
+                freeplay.fitView();
+            }
+            freeplay.focusCanvas();
+            if (schematicsTab >= 0) {
+                freeplay.showSchematics(schematicsTab);
+            }
+        });
     }
 }

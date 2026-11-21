@@ -62,6 +62,10 @@ public final class Gate {
         System.arraycopy(values, 0, inputs, 0, Math.min(values.length, inputs.length));
     }
 
+    public void setInput(int index, boolean value) {
+        inputs[index] = value;
+    }
+
     public Point inputPort(int index) {
         int count = inputs.length;
         return new Point(x, y + HEIGHT * (index + 1) / (count + 1));

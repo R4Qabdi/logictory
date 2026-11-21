@@ -7,6 +7,7 @@ import com.logictory.game.Wire;
 import java.awt.Point;
 import java.awt.geom.Path2D;
 import java.awt.geom.Point2D;
+import java.awt.geom.Rectangle2D;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -21,7 +22,9 @@ import java.util.Set;
  *   <li>wires whose paths run on top of each other are pushed into separate lanes;</li>
  *   <li>when two wires cross, the later wire draws a small hop (bridge) over the earlier one.</li>
  * </ul>
- * Results are cached and recomputed lazily after {@link #invalidate()}.
+ * Results are cached and recomputed lazily after {@link #invalidate()}. While the user
+ * drags gates, {@link #setFastMode(boolean)} skips the O(n^2) lane/crossing analysis so
+ * the board stays fluid; full routing is restored on release.
  */
 public final class WireRouter {
     private static final double STUB = 24.0;
@@ -31,10 +34,14 @@ public final class WireRouter {
     private static final double PARALLEL_DISTANCE = 2.0;
     private static final double PARALLEL_SIN = 0.15;
     private static final double MIN_OVERLAP = 4.0;
+    private static final double HIT_RADIUS = 5.0;
+    /** Beyond this size, lane/crossing analysis costs more than it is worth. */
+    private static final int FULL_ROUTING_LIMIT = 250;
 
     private final Circuit circuit;
     private WireStyle style = WireStyle.SQUARE;
     private boolean dirty = true;
+    private boolean fastMode;
     private Map<Wire, WirePath> paths = Map.of();
 
     public WireRouter(Circuit circuit) {
@@ -56,11 +63,51 @@ public final class WireRouter {
         dirty = true;
     }
 
+    /** Skips lane/crossing analysis for smoother dragging on busy boards. */
+    public void setFastMode(boolean fastMode) {
+        if (this.fastMode != fastMode) {
+            this.fastMode = fastMode;
+            dirty = true;
+        }
+    }
+
+    public boolean fastMode() {
+        return fastMode;
+    }
+
     /** Path used for painting and hit-testing (already contains lane offsets and hops). */
     public Path2D pathFor(Wire wire) {
         ensure();
         WirePath path = paths.get(wire);
         return path == null ? null : path.display();
+    }
+
+    /** True when the point is within the wire's clickable width. */
+    public boolean hitTest(Wire wire, Point2D point) {
+        ensure();
+        WirePath path = paths.get(wire);
+        if (path == null) {
+            return false;
+        }
+        return distanceToPolyline(path.hitPolyline(), point) <= HIT_RADIUS;
+    }
+
+    /** True when any segment of the wire touches the marquee rectangle. */
+    public boolean intersects(Wire wire, Rectangle2D area) {
+        ensure();
+        WirePath path = paths.get(wire);
+        if (path == null) {
+            return false;
+        }
+        List<Point2D.Double> points = path.hitPolyline();
+        for (int i = 0; i + 1 < points.size(); i++) {
+            Point2D.Double from = points.get(i);
+            Point2D.Double to = points.get(i + 1);
+            if (area.intersectsLine(from.x, from.y, to.x, to.y)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Rubber-band path while dragging a new connection; no lanes or hops needed. */
@@ -93,16 +140,34 @@ public final class WireRouter {
 
     private void rebuild() {
         List<Wire> wires = circuit.wires();
+        Map<Integer, Gate> gatesById = new HashMap<>();
+        for (Gate gate : circuit.gates()) {
+            gatesById.put(gate.id(), gate);
+        }
+
+        if (fastMode || wires.size() > FULL_ROUTING_LIMIT) {
+            Map<Wire, WirePath> quick = new HashMap<>(wires.size() * 2);
+            for (Wire wire : wires) {
+                List<Point2D.Double> points = polyline(wire, gatesById, 0);
+                quick.put(wire, new WirePath(polylinePath(points), 0, 0, points));
+            }
+            paths = quick;
+            return;
+        }
+
         List<List<Point2D.Double>> probes = new ArrayList<>(wires.size());
+        List<Rectangle2D> probeBounds = new ArrayList<>(wires.size());
         for (Wire wire : wires) {
-            probes.add(polyline(wire, 0));
+            List<Point2D.Double> probe = polyline(wire, gatesById, 0);
+            probes.add(probe);
+            probeBounds.add(boundsOf(probe));
         }
 
         int[] lanes = new int[wires.size()];
         for (int i = 0; i < wires.size(); i++) {
             Set<Integer> used = new HashSet<>();
             for (int j = 0; j < i; j++) {
-                if (overlaps(probes.get(i), probes.get(j))) {
+                if (overlaps(probes.get(i), probeBounds.get(i), probes.get(j), probeBounds.get(j))) {
                     used.add(lanes[j]);
                 }
             }
@@ -110,25 +175,32 @@ public final class WireRouter {
         }
 
         List<List<Point2D.Double>> routed = new ArrayList<>(wires.size());
+        List<Rectangle2D> routedBounds = new ArrayList<>(wires.size());
         for (int i = 0; i < wires.size(); i++) {
-            routed.add(polyline(wires.get(i), lanes[i] * LANE_GAP));
+            List<Point2D.Double> points = polyline(wires.get(i), gatesById, lanes[i] * LANE_GAP);
+            routed.add(points);
+            routedBounds.add(boundsOf(points));
         }
 
-        Map<Wire, WirePath> result = new HashMap<>();
+        Map<Wire, WirePath> result = new HashMap<>(wires.size() * 2);
         for (int i = 0; i < wires.size(); i++) {
             List<Crossing> crossings = new ArrayList<>();
+            Rectangle2D bounds = routedBounds.get(i);
             for (int j = 0; j < i; j++) {
-                collectCrossings(routed.get(i), routed.get(j), crossings);
+                if (bounds.intersects(routedBounds.get(j))) {
+                    collectCrossings(routed.get(i), routed.get(j), crossings);
+                }
             }
+            Path2D display = buildDisplay(routed.get(i), crossings);
             result.put(wires.get(i),
-                    new WirePath(buildDisplay(routed.get(i), crossings), crossings.size(), lanes[i]));
+                    new WirePath(display, crossings.size(), lanes[i], routed.get(i)));
         }
         paths = result;
     }
 
-    private List<Point2D.Double> polyline(Wire wire, double laneOffset) {
-        Gate source = circuit.gate(wire.sourceId());
-        Gate target = circuit.gate(wire.targetId());
+    private List<Point2D.Double> polyline(Wire wire, Map<Integer, Gate> gatesById, double laneOffset) {
+        Gate source = gatesById.get(wire.sourceId());
+        Gate target = gatesById.get(wire.targetId());
         if (source == null || target == null) {
             return List.of();
         }
@@ -187,6 +259,23 @@ public final class WireRouter {
         return points;
     }
 
+    private static Rectangle2D boundsOf(List<Point2D.Double> points) {
+        if (points.isEmpty()) {
+            return new Rectangle2D.Double();
+        }
+        double minX = Double.MAX_VALUE;
+        double minY = Double.MAX_VALUE;
+        double maxX = -Double.MAX_VALUE;
+        double maxY = -Double.MAX_VALUE;
+        for (Point2D.Double point : points) {
+            minX = Math.min(minX, point.x);
+            minY = Math.min(minY, point.y);
+            maxX = Math.max(maxX, point.x);
+            maxY = Math.max(maxY, point.y);
+        }
+        return new Rectangle2D.Double(minX, minY, maxX - minX, maxY - minY);
+    }
+
     private static int smallestFreeLane(Set<Integer> used) {
         if (!used.contains(0)) {
             return 0;
@@ -202,7 +291,16 @@ public final class WireRouter {
         return 0;
     }
 
-    private static boolean overlaps(List<Point2D.Double> a, List<Point2D.Double> b) {
+    private static boolean overlaps(List<Point2D.Double> a, Rectangle2D aBounds,
+                                    List<Point2D.Double> b, Rectangle2D bBounds) {
+        // Cheap rejection for wires that are nowhere near each other.
+        if (!aBounds.intersects(
+                bBounds.getX() - PARALLEL_DISTANCE,
+                bBounds.getY() - PARALLEL_DISTANCE,
+                bBounds.getWidth() + PARALLEL_DISTANCE * 2,
+                bBounds.getHeight() + PARALLEL_DISTANCE * 2)) {
+            return false;
+        }
         for (int i = 0; i + 1 < a.size(); i++) {
             for (int j = 0; j + 1 < b.size(); j++) {
                 if (collinearOverlap(a.get(i), a.get(i + 1), b.get(j), b.get(j + 1))) {
@@ -258,9 +356,18 @@ public final class WireRouter {
             if (len1 < 1e-6) {
                 continue;
             }
+            double aMinX = Math.min(p1.x, p2.x);
+            double aMaxX = Math.max(p1.x, p2.x);
+            double aMinY = Math.min(p1.y, p2.y);
+            double aMaxY = Math.max(p1.y, p2.y);
             for (int j = 0; j + 1 < b.size(); j++) {
                 Point2D.Double p3 = b.get(j);
                 Point2D.Double p4 = b.get(j + 1);
+                // Segment-level bounding-box rejection avoids the expensive math below.
+                if (aMaxX < Math.min(p3.x, p4.x) || aMinX > Math.max(p3.x, p4.x)
+                        || aMaxY < Math.min(p3.y, p4.y) || aMinY > Math.max(p3.y, p4.y)) {
+                    continue;
+                }
                 double d2x = p4.x - p3.x;
                 double d2y = p4.y - p3.y;
                 double len2 = Math.hypot(d2x, d2y);
@@ -343,6 +450,35 @@ public final class WireRouter {
         return path;
     }
 
+    private static double distanceToPolyline(List<Point2D.Double> points, Point2D point) {
+        if (points.isEmpty()) {
+            return Double.MAX_VALUE;
+        }
+        if (points.size() == 1) {
+            return point.distance(points.get(0));
+        }
+        double best = Double.MAX_VALUE;
+        for (int i = 0; i + 1 < points.size(); i++) {
+            best = Math.min(best, distanceToSegment(point, points.get(i), points.get(i + 1)));
+        }
+        return best;
+    }
+
+    private static double distanceToSegment(Point2D point, Point2D from, Point2D to) {
+        double dx = to.getX() - from.getX();
+        double dy = to.getY() - from.getY();
+        double lengthSquared = dx * dx + dy * dy;
+        if (lengthSquared < 1e-9) {
+            return point.distance(from);
+        }
+        double t = ((point.getX() - from.getX()) * dx + (point.getY() - from.getY()) * dy)
+                / lengthSquared;
+        t = Math.max(0, Math.min(1, t));
+        double x = from.getX() + t * dx;
+        double y = from.getY() + t * dy;
+        return Math.hypot(point.getX() - x, point.getY() - y);
+    }
+
     private static Path2D polylinePath(List<Point2D.Double> polyline) {
         Path2D path = new Path2D.Double();
         if (polyline.isEmpty()) {
@@ -358,6 +494,7 @@ public final class WireRouter {
     private record Crossing(int segment, double t) {
     }
 
-    private record WirePath(Path2D display, int hops, int lane) {
+    private record WirePath(Path2D display, int hops, int lane,
+                            List<Point2D.Double> hitPolyline) {
     }
 }

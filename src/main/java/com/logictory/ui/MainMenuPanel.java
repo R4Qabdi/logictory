@@ -16,19 +16,31 @@ import java.awt.Font;
 import java.awt.Frame;
 import java.awt.GridBagLayout;
 import java.awt.GridLayout;
+import java.util.function.Consumer;
 
 /** Main menu content, embedded in the single application window. */
 public final class MainMenuPanel extends JPanel {
     private final Runnable onFreeplay;
+    private final Consumer<UserSession> onSessionChanged;
+    private final Runnable onSavedSchematics;
+    private final Runnable onOnlineLevels;
     private UserSession session;
     private final JLabel userStatusLabel = new JLabel();
     private JButton onlineLevelsBtn;
     private JButton schematicsBtn;
     private JButton accountBtn;
 
-    public MainMenuPanel(UserSession session, Runnable onFreeplay) {
+    public MainMenuPanel(UserSession session, Runnable onFreeplay, Consumer<UserSession> onSessionChanged) {
+        this(session, onFreeplay, onSessionChanged, null, null);
+    }
+
+    public MainMenuPanel(UserSession session, Runnable onFreeplay, Consumer<UserSession> onSessionChanged,
+                         Runnable onSavedSchematics, Runnable onOnlineLevels) {
         this.session = session;
         this.onFreeplay = onFreeplay;
+        this.onSessionChanged = onSessionChanged;
+        this.onSavedSchematics = onSavedSchematics;
+        this.onOnlineLevels = onOnlineLevels;
 
         setLayout(new GridBagLayout());
         setBorder(new EmptyBorder(24, 24, 24, 24));
@@ -78,23 +90,21 @@ public final class MainMenuPanel extends JPanel {
         freeplayBtn.setFont(freeplayBtn.getFont().deriveFont(Font.BOLD, 15f));
         freeplayBtn.addActionListener(e -> onFreeplay.run());
 
-        onlineLevelsBtn = new JButton("Online Levels");
+        onlineLevelsBtn = new JButton("Online Schematics");
         onlineLevelsBtn.setFont(onlineLevelsBtn.getFont().deriveFont(15f));
-        onlineLevelsBtn.addActionListener(e -> JOptionPane.showMessageDialog(
-                this,
-                "Online Levels browser coming soon!",
-                "Online Levels",
-                JOptionPane.INFORMATION_MESSAGE
-        ));
+        onlineLevelsBtn.addActionListener(e -> {
+            if (onOnlineLevels != null) {
+                onOnlineLevels.run();
+            }
+        });
 
         schematicsBtn = new JButton("My Schematics (Upload / Save)");
         schematicsBtn.setFont(schematicsBtn.getFont().deriveFont(15f));
-        schematicsBtn.addActionListener(e -> JOptionPane.showMessageDialog(
-                this,
-                "Schematics Manager coming soon!",
-                "My Schematics",
-                JOptionPane.INFORMATION_MESSAGE
-        ));
+        schematicsBtn.addActionListener(e -> {
+            if (onSavedSchematics != null) {
+                onSavedSchematics.run();
+            }
+        });
 
         accountBtn = new JButton();
         accountBtn.setFont(accountBtn.getFont().deriveFont(15f));
@@ -125,12 +135,16 @@ public final class MainMenuPanel extends JPanel {
             accountBtn.setText("Logout");
         }
 
-        onlineLevelsBtn.setEnabled(!isGuest);
-        schematicsBtn.setEnabled(!isGuest);
-
-        String guestTip = isGuest ? "Sign in with an account to use online features." : null;
-        onlineLevelsBtn.setToolTipText(guestTip);
-        schematicsBtn.setToolTipText(guestTip);
+        // Guests can still browse community circuits and manage local schematics;
+        // only publishing and database-backed saves require an account.
+        onlineLevelsBtn.setEnabled(true);
+        schematicsBtn.setEnabled(true);
+        onlineLevelsBtn.setToolTipText(isGuest
+                ? "Browse community schematics; sign in to publish."
+                : "Browse and copy community schematics.");
+        schematicsBtn.setToolTipText(isGuest
+                ? "Manage local schematics; sign in to save to your account."
+                : "Manage and publish your schematics.");
     }
 
     private void switchAccount() {
@@ -139,6 +153,7 @@ public final class MainMenuPanel extends JPanel {
         UserSession newSession = dialog.showDialog();
         if (newSession != null) {
             this.session = newSession;
+            onSessionChanged.accept(newSession);
             refreshSessionState();
         }
     }

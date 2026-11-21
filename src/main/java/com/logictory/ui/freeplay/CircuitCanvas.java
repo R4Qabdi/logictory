@@ -2,46 +2,70 @@ package com.logictory.ui.freeplay;
 
 import com.logictory.game.Circuit;
 import com.logictory.game.CircuitSimulator;
+import com.logictory.game.CircuitState;
 import com.logictory.game.Gate;
 import com.logictory.game.GateType;
 import com.logictory.game.Wire;
+import com.logictory.prefs.AppPreferences;
 
 import javax.swing.AbstractAction;
 import javax.swing.JPanel;
 import javax.swing.KeyStroke;
 import javax.swing.SwingUtilities;
 import java.awt.BasicStroke;
+import java.awt.Color;
 import java.awt.Cursor;
 import java.awt.Dimension;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
+import java.awt.HeadlessException;
 import java.awt.Point;
 import java.awt.RenderingHints;
+import java.awt.Toolkit;
+import java.awt.Window;
 import java.awt.event.ActionEvent;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
+import java.awt.event.InputEvent;
+import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseWheelEvent;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
+import java.awt.event.WindowFocusListener;
 import java.awt.geom.Path2D;
 import java.awt.geom.Point2D;
+import java.awt.geom.Rectangle2D;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.function.Consumer;
 
 /**
  * Freeplay board: drag gates around, wire outputs to inputs, toggle inputs and pan/zoom.
  * All geometry is stored in "world" coordinates; the view transform maps it to the screen.
+ * Selection is multi-item (shift/ctrl to add), and edits are undoable.
  */
 public final class CircuitCanvas extends JPanel {
     private static final int GRID = 10;
     private static final double MIN_ZOOM = 0.35;
     private static final double MAX_ZOOM = 3.0;
     private static final double PORT_HIT_RADIUS = 9.0;
-    private static final double WIRE_HIT_WIDTH = 10.0;
+    private static final int MAX_HISTORY = 100;
+    private static final int PASTE_OFFSET = GRID * 2;
 
     private final Circuit circuit;
     private final WireRouter router;
     private Consumer<String> statusSink = message -> {
+    };
+    private Runnable editStateListener = () -> {
     };
     private boolean stable = true;
 
@@ -49,17 +73,25 @@ public final class CircuitCanvas extends JPanel {
     private double panX = 60;
     private double panY = 40;
     private boolean autoFit = true;
+    private boolean showGrid = true;
+    private boolean snapToGrid = true;
 
-    private Gate selectedGate;
-    private Wire selectedWire;
+    private final Set<Gate> selectedGates = new LinkedHashSet<>();
+    private final Set<Wire> selectedWires = new LinkedHashSet<>();
 
     private Gate draggingGate;
-    private double dragOffsetX;
-    private double dragOffsetY;
-    private boolean gateMoved;
+    private Point2D dragStartWorld;
+    private final Map<Gate, Point> dragOrigins = new LinkedHashMap<>();
+    private boolean dragMoved;
+    private boolean dragAdditive;
+    private boolean dragSoleSelection;
 
     private Gate wiringSource;
     private Point2D wiringPoint;
+
+    private Point2D marqueeStart;
+    private Point2D marqueeEnd;
+    private boolean marqueeAdditive;
 
     private GateType ghostType;
     private Point2D ghostPoint;
@@ -69,10 +101,23 @@ public final class CircuitCanvas extends JPanel {
     private double panStartX;
     private double panStartY;
     private boolean spaceDown;
+    private WindowFocusListener windowFocusListener;
+
+    private double visibleLeft;
+    private double visibleTop;
+    private double visibleRight;
+    private double visibleBottom;
 
     private Gate hoverGate;
     private int hoverInput = -1;
     private boolean hoverOutput;
+
+    private final Deque<CircuitState> undoStack = new ArrayDeque<>();
+    private final Deque<CircuitState> redoStack = new ArrayDeque<>();
+    private CircuitState pendingUndo;
+
+    private Clipboard clipboard;
+    private int pasteSerial;
 
     public CircuitCanvas(Circuit circuit) {
         this.circuit = circuit;
@@ -122,6 +167,42 @@ public final class CircuitCanvas extends JPanel {
     }
 
     @Override
+    public void addNotify() {
+        super.addNotify();
+        Window window = SwingUtilities.getWindowAncestor(this);
+        if (window == null) {
+            return;
+        }
+        if (windowFocusListener == null) {
+            windowFocusListener = new WindowAdapter() {
+                @Override
+                public void windowLostFocus(WindowEvent e) {
+                    // Do not leave the board stuck in pan mode after Alt+Tab.
+                    spaceDown = false;
+                    panning = false;
+                    updateCursor();
+                }
+            };
+        }
+        window.removeWindowFocusListener(windowFocusListener);
+        window.addWindowFocusListener(windowFocusListener);
+    }
+
+    @Override
+    public void removeNotify() {
+        Window window = SwingUtilities.getWindowAncestor(this);
+        if (window != null && windowFocusListener != null) {
+            window.removeWindowFocusListener(windowFocusListener);
+        }
+        super.removeNotify();
+    }
+
+    /** Gives the board keyboard focus so shortcuts (and hold-space panning) work immediately. */
+    public void focusCanvas() {
+        requestFocusInWindow();
+    }
+
+    @Override
     public Dimension getPreferredSize() {
         return new Dimension(900, 620);
     }
@@ -149,13 +230,15 @@ public final class CircuitCanvas extends JPanel {
         }
         if (contains(canvasPoint)) {
             Point2D origin = toGateOrigin(screenToWorld(canvasPoint));
+            beginMutation();
             Gate gate = circuit.addGate(ghostType,
                     snap((int) Math.round(origin.getX())),
                     snap((int) Math.round(origin.getY())));
-            selectedGate = gate;
-            selectedWire = null;
+            clearSelection();
+            selectedGates.add(gate);
             router.invalidate();
             refreshSimulation();
+            commitMutation();
         }
         ghostType = null;
         ghostPoint = null;
@@ -174,6 +257,12 @@ public final class CircuitCanvas extends JPanel {
         updateStatus();
     }
 
+    public void setEditStateListener(Runnable listener) {
+        this.editStateListener = listener == null ? () -> {
+        } : listener;
+        editStateListener.run();
+    }
+
     public void setWireStyle(WireStyle style) {
         router.setStyle(style);
         repaint();
@@ -181,6 +270,42 @@ public final class CircuitCanvas extends JPanel {
 
     public WireStyle wireStyle() {
         return router.style();
+    }
+
+    /** Applies the persisted preferences to this board. */
+    public void applyPreferences(AppPreferences preferences) {
+        setWireStyle(preferences.wireStyle());
+        showGrid = preferences.showGrid();
+        snapToGrid = preferences.snapToGrid();
+        repaint();
+    }
+
+    public boolean showGrid() {
+        return showGrid;
+    }
+
+    public boolean snapToGrid() {
+        return snapToGrid;
+    }
+
+    public boolean canUndo() {
+        return !undoStack.isEmpty();
+    }
+
+    public boolean canRedo() {
+        return !redoStack.isEmpty();
+    }
+
+    public boolean hasSelection() {
+        return !selectedGates.isEmpty() || !selectedWires.isEmpty();
+    }
+
+    public boolean hasGateSelection() {
+        return !selectedGates.isEmpty();
+    }
+
+    public boolean hasClipboard() {
+        return clipboard != null && !clipboard.gates().isEmpty();
     }
 
     public void refreshSimulation() {
@@ -195,6 +320,14 @@ public final class CircuitCanvas extends JPanel {
         panY = 40;
         updateStatus();
         repaint();
+    }
+
+    public void zoomIn() {
+        zoomAt(1.1, new Point(getWidth() / 2, getHeight() / 2));
+    }
+
+    public void zoomOut() {
+        zoomAt(1 / 1.1, new Point(getWidth() / 2, getHeight() / 2));
     }
 
     /** Zooms/pans so every gate is visible with a small margin. */
@@ -228,11 +361,152 @@ public final class CircuitCanvas extends JPanel {
     }
 
     public void clearBoard() {
+        if (circuit.gates().isEmpty() && circuit.wires().isEmpty()) {
+            return;
+        }
+        beginMutation();
         circuit.clear();
-        selectedGate = null;
-        selectedWire = null;
+        clearSelection();
         router.invalidate();
         refreshSimulation();
+        commitMutation();
+        repaint();
+    }
+
+    /** Replaces the board with a schematic snapshot. The change can be undone. */
+    public void loadState(CircuitState state) {
+        cancelInteraction();
+        beginMutation();
+        circuit.restore(state);
+        clearSelection();
+        router.invalidate();
+        refreshSimulation();
+        commitMutation();
+        fitView();
+        repaint();
+    }
+
+    public void undo() {
+        if (undoStack.isEmpty()) {
+            return;
+        }
+        pendingUndo = null;
+        redoStack.push(circuit.snapshot());
+        restoreState(undoStack.pop());
+    }
+
+    public void redo() {
+        if (redoStack.isEmpty()) {
+            return;
+        }
+        pendingUndo = null;
+        undoStack.push(circuit.snapshot());
+        restoreState(redoStack.pop());
+    }
+
+    public void selectAll() {
+        selectedGates.clear();
+        selectedWires.clear();
+        selectedGates.addAll(circuit.gates());
+        selectedWires.addAll(circuit.wires());
+        updateStatus();
+        repaint();
+    }
+
+    public void copySelection() {
+        if (selectedGates.isEmpty()) {
+            return;
+        }
+        List<CircuitState.GateState> gates = new ArrayList<>();
+        Set<Integer> ids = new LinkedHashSet<>();
+        for (Gate gate : circuit.gates()) {
+            if (selectedGates.contains(gate)) {
+                gates.add(new CircuitState.GateState(
+                        gate.id(), gate.type(), gate.x(), gate.y(), gate.output()));
+                ids.add(gate.id());
+            }
+        }
+        List<Wire> wires = new ArrayList<>();
+        for (Wire wire : circuit.wires()) {
+            if (ids.contains(wire.sourceId()) && ids.contains(wire.targetId())) {
+                wires.add(wire);
+            }
+        }
+        clipboard = new Clipboard(gates, wires);
+        pasteSerial = 0;
+        updateStatus();
+    }
+
+    public void copyState(CircuitState state) {
+        clipboard = new Clipboard(state.gates(), state.wires());
+        pasteSerial = 0;
+        updateStatus();
+    }
+
+    /** Returns a standalone snapshot of the selected gates and the wires between them. */
+    public CircuitState selectedState() {
+        if (selectedGates.isEmpty()) {
+            return null;
+        }
+        List<CircuitState.GateState> gates = new ArrayList<>();
+        Set<Integer> ids = new LinkedHashSet<>();
+        int nextId = 1;
+        for (Gate gate : circuit.gates()) {
+            if (selectedGates.contains(gate)) {
+                gates.add(new CircuitState.GateState(
+                        gate.id(), gate.type(), gate.x(), gate.y(), gate.output()));
+                ids.add(gate.id());
+                nextId = Math.max(nextId, gate.id() + 1);
+            }
+        }
+        List<Wire> wires = new ArrayList<>();
+        for (Wire wire : circuit.wires()) {
+            if (ids.contains(wire.sourceId()) && ids.contains(wire.targetId())) {
+                wires.add(wire);
+            }
+        }
+        return new CircuitState(gates, wires, nextId);
+    }
+
+    public CircuitState schematicState() {
+        CircuitState selected = selectedState();
+        return selected == null ? circuit.snapshot() : selected;
+    }
+
+    public void cutSelection() {
+        if (!hasSelection()) {
+            return;
+        }
+        copySelection();
+        deleteSelection();
+    }
+
+    public void pasteClipboard() {
+        if (!hasClipboard()) {
+            return;
+        }
+        beginMutation();
+        clearSelection();
+        int offset = PASTE_OFFSET * ++pasteSerial;
+        Map<Integer, Gate> remapped = new HashMap<>();
+        for (CircuitState.GateState gateState : clipboard.gates()) {
+            Gate gate = circuit.addGate(gateState.type(),
+                    snap(gateState.x() + offset),
+                    snap(gateState.y() + offset));
+            gate.setOutput(gateState.output());
+            remapped.put(gateState.id(), gate);
+            selectedGates.add(gate);
+        }
+        for (Wire wire : clipboard.wires()) {
+            Gate source = remapped.get(wire.sourceId());
+            Gate target = remapped.get(wire.targetId());
+            if (source != null && target != null) {
+                circuit.connect(source.id(), target.id(), wire.targetPort());
+            }
+        }
+        router.invalidate();
+        refreshSimulation();
+        commitMutation();
         repaint();
     }
 
@@ -256,25 +530,27 @@ public final class CircuitCanvas extends JPanel {
         }
 
         Point2D world = screenToWorld(p);
+        boolean additive = e.isShiftDown() || e.isControlDown();
+
         PortHit port = findPort(world);
         if (port != null) {
             if (port.output()) {
                 wiringSource = port.gate();
                 wiringPoint = world;
-                selectedGate = port.gate();
-                selectedWire = null;
+                clearSelection();
+                selectedGates.add(port.gate());
                 updateStatus();
                 repaint();
                 return;
             }
             Wire existing = circuit.wireInto(port.gate().id(), port.index());
             if (existing != null) {
+                beginMutation();
                 circuit.disconnect(existing);
+                selectedWires.remove(existing);
                 router.invalidate();
-                if (existing.equals(selectedWire)) {
-                    selectedWire = null;
-                }
                 refreshSimulation();
+                commitMutation();
                 repaint();
                 return;
             }
@@ -282,13 +558,30 @@ public final class CircuitCanvas extends JPanel {
 
         Gate gate = findGate(world);
         if (gate != null) {
+            if (additive && selectedGates.contains(gate)) {
+                selectedGates.remove(gate);
+                updateStatus();
+                repaint();
+                return;
+            }
             circuit.bringToFront(gate);
-            selectedGate = gate;
-            selectedWire = null;
+            if (additive) {
+                selectedGates.add(gate);
+            } else if (!selectedGates.contains(gate)) {
+                clearSelection();
+                selectedGates.add(gate);
+            }
             draggingGate = gate;
-            gateMoved = false;
-            dragOffsetX = world.getX() - gate.x();
-            dragOffsetY = world.getY() - gate.y();
+            dragStartWorld = world;
+            dragMoved = false;
+            dragAdditive = additive;
+            dragSoleSelection = !additive && selectedGates.size() == 1
+                    && selectedGates.contains(gate) && selectedWires.isEmpty();
+            dragOrigins.clear();
+            for (Gate selected : selectedGates) {
+                dragOrigins.put(selected, new Point(selected.x(), selected.y()));
+            }
+            beginMutation();
             updateStatus();
             repaint();
             return;
@@ -296,15 +589,26 @@ public final class CircuitCanvas extends JPanel {
 
         Wire wire = findWire(world);
         if (wire != null) {
-            selectedWire = wire;
-            selectedGate = null;
+            if (additive) {
+                if (!selectedWires.add(wire)) {
+                    selectedWires.remove(wire);
+                }
+            } else {
+                clearSelection();
+                selectedWires.add(wire);
+            }
             updateStatus();
             repaint();
             return;
         }
 
-        selectedGate = null;
-        selectedWire = null;
+        if (!additive) {
+            clearSelection();
+        }
+        marqueeAdditive = additive;
+        marqueeStart = world;
+        marqueeEnd = world;
+        updateCursor();
         updateStatus();
         repaint();
     }
@@ -318,12 +622,23 @@ public final class CircuitCanvas extends JPanel {
         }
 
         Point2D world = screenToWorld(e.getPoint());
-        if (draggingGate != null) {
-            int nx = snap((int) Math.round(world.getX() - dragOffsetX));
-            int ny = snap((int) Math.round(world.getY() - dragOffsetY));
-            if (nx != draggingGate.x() || ny != draggingGate.y()) {
-                draggingGate.moveTo(nx, ny);
-                gateMoved = true;
+        if (draggingGate != null && dragStartWorld != null) {
+            int dx = snap((int) Math.round(world.getX() - dragStartWorld.getX()));
+            int dy = snap((int) Math.round(world.getY() - dragStartWorld.getY()));
+            boolean changed = false;
+            for (Map.Entry<Gate, Point> entry : dragOrigins.entrySet()) {
+                Gate gate = entry.getKey();
+                int nx = entry.getValue().x + dx;
+                int ny = entry.getValue().y + dy;
+                if (gate.x() != nx || gate.y() != ny) {
+                    gate.moveTo(nx, ny);
+                    changed = true;
+                }
+            }
+            if (changed) {
+                dragMoved = true;
+                // Full lane/hop routing is O(n^2); use simple paths until the drag ends.
+                router.setFastMode(true);
                 router.invalidate();
             }
             repaint();
@@ -332,6 +647,12 @@ public final class CircuitCanvas extends JPanel {
 
         if (wiringSource != null) {
             wiringPoint = world;
+            repaint();
+            return;
+        }
+
+        if (marqueeStart != null) {
+            marqueeEnd = world;
             repaint();
         }
     }
@@ -344,26 +665,50 @@ public final class CircuitCanvas extends JPanel {
         }
 
         if (draggingGate != null) {
-            if (!gateMoved && draggingGate.type() == GateType.INPUT) {
-                draggingGate.setOutput(!draggingGate.output());
-                refreshSimulation();
+            Gate clicked = draggingGate;
+            if (!dragMoved) {
+                if (!dragAdditive && (selectedGates.size() > 1 || !selectedWires.isEmpty())) {
+                    clearSelection();
+                    selectedGates.add(clicked);
+                }
+                if (dragSoleSelection && clicked.type() == GateType.INPUT) {
+                    clicked.setOutput(!clicked.output());
+                    refreshSimulation();
+                }
             }
             draggingGate = null;
-            gateMoved = false;
+            dragStartWorld = null;
+            dragOrigins.clear();
+            dragMoved = false;
+            dragAdditive = false;
+            dragSoleSelection = false;
+            router.setFastMode(false);
+            router.invalidate();
+            commitMutation();
             repaint();
             return;
         }
 
         if (wiringSource != null) {
             PortHit port = findPort(screenToWorld(e.getPoint()));
-            if (port != null && !port.output() && port.gate() != wiringSource
-                    && circuit.connect(wiringSource.id(), port.gate().id(), port.index())) {
-                router.invalidate();
-                refreshSimulation();
+            if (port != null && !port.output() && port.gate() != wiringSource) {
+                beginMutation();
+                if (circuit.connect(wiringSource.id(), port.gate().id(), port.index())) {
+                    router.invalidate();
+                    refreshSimulation();
+                    commitMutation();
+                } else {
+                    pendingUndo = null;
+                }
             }
             wiringSource = null;
             wiringPoint = null;
             repaint();
+            return;
+        }
+
+        if (marqueeStart != null) {
+            finishMarquee();
         }
     }
 
@@ -401,7 +746,7 @@ public final class CircuitCanvas extends JPanel {
     private void updateCursor() {
         if (panning) {
             setCursor(Cursor.getPredefinedCursor(Cursor.MOVE_CURSOR));
-        } else if (hoverGate != null) {
+        } else if (hoverGate != null || marqueeStart != null) {
             setCursor(Cursor.getPredefinedCursor(Cursor.CROSSHAIR_CURSOR));
         } else if (spaceDown) {
             setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
@@ -411,18 +756,134 @@ public final class CircuitCanvas extends JPanel {
     }
 
     private void handleWheel(MouseWheelEvent e) {
+        zoomAt(Math.pow(1.1, -e.getPreciseWheelRotation()), e.getPoint());
+    }
+
+    private void zoomAt(double factor, Point anchor) {
         autoFit = false;
-        Point2D before = screenToWorld(e.getPoint());
-        double factor = Math.pow(1.1, -e.getPreciseWheelRotation());
+        Point2D before = screenToWorld(anchor);
         double newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * factor));
         if (newZoom == zoom) {
             return;
         }
         zoom = newZoom;
-        panX = e.getX() - before.getX() * zoom;
-        panY = e.getY() - before.getY() * zoom;
+        panX = anchor.x - before.getX() * zoom;
+        panY = anchor.y - before.getY() * zoom;
         updateStatus();
         repaint();
+    }
+
+    // ---------------------------------------------------------------- selection
+
+    private void finishMarquee() {
+        Point2D start = marqueeStart;
+        Point2D end = marqueeEnd;
+        boolean additive = marqueeAdditive;
+        marqueeStart = null;
+        marqueeEnd = null;
+        marqueeAdditive = false;
+
+        if (start == null || end == null) {
+            return;
+        }
+        Rectangle2D area = rectangleBetween(start, end);
+        if (area.getWidth() < 3 && area.getHeight() < 3) {
+            if (!additive) {
+                clearSelection();
+            }
+        } else {
+            for (Gate gate : circuit.gates()) {
+                Rectangle2D bounds = new Rectangle2D.Double(
+                        gate.x(), gate.y(), Gate.WIDTH, Gate.HEIGHT);
+                if (area.intersects(bounds)) {
+                    selectedGates.add(gate);
+                }
+            }
+            for (Wire wire : circuit.wires()) {
+                if (router.intersects(wire, area)) {
+                    selectedWires.add(wire);
+                }
+            }
+        }
+        updateCursor();
+        updateStatus();
+        repaint();
+    }
+
+    private static Rectangle2D rectangleBetween(Point2D a, Point2D b) {
+        double x = Math.min(a.getX(), b.getX());
+        double y = Math.min(a.getY(), b.getY());
+        return new Rectangle2D.Double(x, y,
+                Math.abs(a.getX() - b.getX()), Math.abs(a.getY() - b.getY()));
+    }
+
+    private void clearSelection() {
+        selectedGates.clear();
+        selectedWires.clear();
+    }
+
+    // ---------------------------------------------------------------- history
+
+    private void beginMutation() {
+        if (pendingUndo == null) {
+            pendingUndo = circuit.snapshot();
+        }
+    }
+
+    private void commitMutation() {
+        if (pendingUndo == null) {
+            return;
+        }
+        CircuitState before = pendingUndo;
+        pendingUndo = null;
+        if (before.equals(circuit.snapshot())) {
+            return;
+        }
+        undoStack.push(before);
+        while (undoStack.size() > MAX_HISTORY) {
+            undoStack.removeLast();
+        }
+        redoStack.clear();
+        updateStatus();
+    }
+
+    private void restoreState(CircuitState state) {
+        circuit.restore(state);
+        clearSelection();
+        cancelInteraction();
+        router.invalidate();
+        refreshSimulation();
+        repaint();
+    }
+
+    /** Reverts an in-progress gesture (for example a drag cancelled with Escape). */
+    private void revertPending() {
+        if (pendingUndo == null) {
+            return;
+        }
+        CircuitState before = pendingUndo;
+        pendingUndo = null;
+        if (!before.equals(circuit.snapshot())) {
+            circuit.restore(before);
+            router.invalidate();
+            refreshSimulation();
+        }
+    }
+
+    private void cancelInteraction() {
+        draggingGate = null;
+        dragStartWorld = null;
+        dragOrigins.clear();
+        dragMoved = false;
+        dragAdditive = false;
+        dragSoleSelection = false;
+        wiringSource = null;
+        wiringPoint = null;
+        marqueeStart = null;
+        marqueeEnd = null;
+        marqueeAdditive = false;
+        pendingUndo = null;
+        router.setFastMode(false);
     }
 
     // ---------------------------------------------------------------- hit testing
@@ -463,13 +924,7 @@ public final class CircuitCanvas extends JPanel {
         List<Wire> wires = circuit.wires();
         for (int i = wires.size() - 1; i >= 0; i--) {
             Wire wire = wires.get(i);
-            Path2D path = router.pathFor(wire);
-            if (path == null) {
-                continue;
-            }
-            BasicStroke stroke = new BasicStroke((float) WIRE_HIT_WIDTH,
-                    BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND);
-            if (stroke.createStrokedShape(path).contains(world)) {
+            if (router.hitTest(wire, world)) {
                 return wire;
             }
         }
@@ -485,13 +940,21 @@ public final class CircuitCanvas extends JPanel {
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
         g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
 
-        paintGrid(g2);
+        visibleLeft = -panX / zoom;
+        visibleTop = -panY / zoom;
+        visibleRight = (getWidth() - panX) / zoom;
+        visibleBottom = (getHeight() - panY) / zoom;
+
+        if (showGrid) {
+            paintGrid(g2);
+        }
 
         g2.translate(panX, panY);
         g2.scale(zoom, zoom);
 
         paintWires(g2);
         paintGates(g2);
+        paintMarquee(g2);
         paintWiringPreview(g2);
         paintGhost(g2);
 
@@ -499,48 +962,83 @@ public final class CircuitCanvas extends JPanel {
     }
 
     private void paintGrid(Graphics2D g2) {
-        Point2D topLeft = screenToWorld(new Point(0, 0));
-        Point2D bottomRight = screenToWorld(new Point(getWidth(), getHeight()));
-        int startX = ((int) Math.floor(topLeft.getX() / GRID)) * GRID;
-        int startY = ((int) Math.floor(topLeft.getY() / GRID)) * GRID;
+        // At low zoom the 10px grid becomes visual noise and costs many draw calls,
+        // so only the major lines are drawn until there is room for the minor ones.
+        boolean drawMinor = zoom * GRID >= 5;
+        int step = drawMinor ? GRID : GRID * 5;
+        int startX = ((int) Math.floor(visibleLeft / step)) * step;
+        int startY = ((int) Math.floor(visibleTop / step)) * step;
 
-        for (int x = startX; x <= bottomRight.getX(); x += GRID) {
+        for (int x = startX; x <= visibleRight; x += step) {
             int sx = (int) Math.round(x * zoom + panX);
-            g2.setColor(x % (GRID * 5) == 0 ? GatePainter.GRID_MAJOR : GatePainter.GRID_MINOR);
+            g2.setColor(!drawMinor || x % (GRID * 5) == 0
+                    ? GatePainter.GRID_MAJOR : GatePainter.GRID_MINOR);
             g2.drawLine(sx, 0, sx, getHeight());
         }
-        for (int y = startY; y <= bottomRight.getY(); y += GRID) {
+        for (int y = startY; y <= visibleBottom; y += step) {
             int sy = (int) Math.round(y * zoom + panY);
-            g2.setColor(y % (GRID * 5) == 0 ? GatePainter.GRID_MAJOR : GatePainter.GRID_MINOR);
+            g2.setColor(!drawMinor || y % (GRID * 5) == 0
+                    ? GatePainter.GRID_MAJOR : GatePainter.GRID_MINOR);
             g2.drawLine(0, sy, getWidth(), sy);
         }
     }
 
     private void paintWires(Graphics2D g2) {
         float width = (float) (2.4 / zoom);
+        BasicStroke normal = new BasicStroke(width,
+                BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND);
+        BasicStroke highlighted = new BasicStroke(width * 1.5f,
+                BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND);
         for (Wire wire : circuit.wires()) {
             Path2D path = router.pathFor(wire);
-            if (path == null) {
+            if (path == null || !isVisible(path.getBounds2D())) {
                 continue;
             }
             Gate source = circuit.gate(wire.sourceId());
             boolean on = source != null && source.output();
-            boolean selected = wire.equals(selectedWire);
+            boolean selected = selectedWires.contains(wire);
             g2.setColor(selected ? GatePainter.ACCENT : (on ? GatePainter.WIRE_ON : GatePainter.WIRE_OFF));
-            g2.setStroke(new BasicStroke(selected ? width * 1.5f : width,
-                    BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            g2.setStroke(selected ? highlighted : normal);
             g2.draw(path);
         }
     }
 
     private void paintGates(Graphics2D g2) {
         for (Gate gate : circuit.gates()) {
-            GatePainter.paintGate(g2, gate, gate == selectedGate, zoom);
+            if (isGateVisible(gate)) {
+                GatePainter.paintGate(g2, gate, selectedGates.contains(gate), zoom);
+            }
         }
         for (Gate gate : circuit.gates()) {
+            if (!isGateVisible(gate)) {
+                continue;
+            }
             boolean hovered = gate == hoverGate;
             GatePainter.paintPorts(g2, gate, zoom, hovered ? hoverInput : -1, hovered && hoverOutput);
         }
+    }
+
+    private boolean isGateVisible(Gate gate) {
+        return gate.x() + Gate.WIDTH >= visibleLeft && gate.x() <= visibleRight
+                && gate.y() + Gate.HEIGHT >= visibleTop && gate.y() <= visibleBottom;
+    }
+
+    private boolean isVisible(Rectangle2D bounds) {
+        return bounds.getMaxX() >= visibleLeft && bounds.getMinX() <= visibleRight
+                && bounds.getMaxY() >= visibleTop && bounds.getMinY() <= visibleBottom;
+    }
+
+    private void paintMarquee(Graphics2D g2) {
+        if (marqueeStart == null || marqueeEnd == null) {
+            return;
+        }
+        Rectangle2D area = rectangleBetween(marqueeStart, marqueeEnd);
+        g2.setColor(new Color(0xff, 0xb4, 0x54, 36));
+        g2.fill(area);
+        g2.setColor(GatePainter.ACCENT);
+        g2.setStroke(new BasicStroke((float) (1.2 / zoom), BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER,
+                10f, new float[]{(float) (6 / zoom), (float) (4 / zoom)}, 0f));
+        g2.draw(area);
     }
 
     private void paintWiringPreview(Graphics2D g2) {
@@ -567,84 +1065,123 @@ public final class CircuitCanvas extends JPanel {
 
     // ---------------------------------------------------------------- helpers
 
-    private void deleteSelection() {
-        boolean changed = false;
-        if (selectedGate != null) {
-            circuit.removeGate(selectedGate);
-            selectedGate = null;
-            changed = true;
+    public void deleteSelection() {
+        if (!hasSelection()) {
+            return;
         }
-        if (selectedWire != null) {
-            circuit.disconnect(selectedWire);
-            selectedWire = null;
-            changed = true;
+        beginMutation();
+        List<Gate> gates = new ArrayList<>(selectedGates);
+        List<Wire> wires = new ArrayList<>(selectedWires);
+        clearSelection();
+        for (Gate gate : gates) {
+            circuit.removeGate(gate);
         }
-        if (changed) {
-            router.invalidate();
-            refreshSimulation();
-            repaint();
+        for (Wire wire : wires) {
+            circuit.disconnect(wire);
         }
+        router.invalidate();
+        refreshSimulation();
+        commitMutation();
+        repaint();
     }
 
     private void updateStatus() {
-        String selection = selectedGate != null
-                ? selectedGate.type().displayName() + " #" + selectedGate.id()
-                : selectedWire != null ? "a wire" : "nothing";
         statusSink.accept(String.format("Zoom %d%%  •  %s  •  selected: %s",
                 (int) Math.round(zoom * 100),
                 stable ? "circuit stable" : "unstable circuit (feedback loop)",
-                selection));
+                selectionSummary()));
+        editStateListener.run();
+    }
+
+    private String selectionSummary() {
+        int gates = selectedGates.size();
+        int wires = selectedWires.size();
+        if (gates == 0 && wires == 0) {
+            return "nothing";
+        }
+        if (gates == 1 && wires == 0) {
+            Gate gate = selectedGates.iterator().next();
+            return gate.type().displayName() + " #" + gate.id();
+        }
+        if (gates == 0 && wires == 1) {
+            return "a wire";
+        }
+        if (wires == 0) {
+            return gates + " gates";
+        }
+        if (gates == 0) {
+            return wires + " wires";
+        }
+        return gates + " gates, " + wires + " wires";
     }
 
     private Point2D screenToWorld(Point p) {
         return new Point2D.Double((p.x - panX) / zoom, (p.y - panY) / zoom);
     }
 
-    private static int snap(int value) {
-        return Math.round(value / (float) GRID) * GRID;
+    private int snap(int value) {
+        return snapToGrid ? Math.round(value / (float) GRID) * GRID : value;
     }
 
     private void installKeyBindings() {
-        getInputMap(WHEN_FOCUSED).put(KeyStroke.getKeyStroke("DELETE"), "deleteSelection");
-        getInputMap(WHEN_FOCUSED).put(KeyStroke.getKeyStroke("BACK_SPACE"), "deleteSelection");
-        getActionMap().put("deleteSelection", new AbstractAction() {
-            @Override
-            public void actionPerformed(ActionEvent e) {
-                deleteSelection();
-            }
+        int menuMask;
+        try {
+            menuMask = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx();
+        } catch (HeadlessException e) {
+            menuMask = InputEvent.CTRL_DOWN_MASK;
+        }
+
+        bind(KeyStroke.getKeyStroke("DELETE"), "deleteSelection", this::deleteSelection);
+        bind(KeyStroke.getKeyStroke("BACK_SPACE"), "deleteSelection", this::deleteSelection);
+        bind(KeyStroke.getKeyStroke(KeyEvent.VK_Z, menuMask), "undo", this::undo);
+        bind(KeyStroke.getKeyStroke(KeyEvent.VK_Z, menuMask | InputEvent.SHIFT_DOWN_MASK), "redo", this::redo);
+        bind(KeyStroke.getKeyStroke(KeyEvent.VK_Y, menuMask), "redo", this::redo);
+        bind(KeyStroke.getKeyStroke(KeyEvent.VK_A, menuMask), "selectAll", this::selectAll);
+        bind(KeyStroke.getKeyStroke(KeyEvent.VK_C, menuMask), "copySelection", this::copySelection);
+        bind(KeyStroke.getKeyStroke(KeyEvent.VK_X, menuMask), "cutSelection", this::cutSelection);
+        bind(KeyStroke.getKeyStroke(KeyEvent.VK_V, menuMask), "pasteClipboard", this::pasteClipboard);
+
+        bind(KeyStroke.getKeyStroke("ESCAPE"), "cancelInteraction", () -> {
+            revertPending();
+            cancelInteraction();
+            clearSelection();
+            updateStatus();
+            repaint();
         });
 
-        getInputMap(WHEN_FOCUSED).put(KeyStroke.getKeyStroke("ESCAPE"), "cancelInteraction");
-        getActionMap().put("cancelInteraction", new AbstractAction() {
-            @Override
-            public void actionPerformed(ActionEvent e) {
-                draggingGate = null;
-                wiringSource = null;
-                wiringPoint = null;
-                gateMoved = false;
-                repaint();
-            }
+        // Works wherever focus is inside the freeplay window, not only after clicking
+        // the board. The status hint explicitly advertises hold-space panning.
+        bindGlobal(KeyStroke.getKeyStroke("pressed SPACE"), "panModeOn", () -> {
+            spaceDown = true;
+            updateCursor();
         });
-
-        getInputMap(WHEN_FOCUSED).put(KeyStroke.getKeyStroke("pressed SPACE"), "panModeOn");
-        getActionMap().put("panModeOn", new AbstractAction() {
-            @Override
-            public void actionPerformed(ActionEvent e) {
-                spaceDown = true;
-                updateCursor();
-            }
+        bindGlobal(KeyStroke.getKeyStroke("released SPACE"), "panModeOff", () -> {
+            spaceDown = false;
+            updateCursor();
         });
+    }
 
-        getInputMap(WHEN_FOCUSED).put(KeyStroke.getKeyStroke("released SPACE"), "panModeOff");
-        getActionMap().put("panModeOff", new AbstractAction() {
+    private void bind(KeyStroke stroke, String name, Runnable action) {
+        bindTo(getInputMap(WHEN_FOCUSED), stroke, name, action);
+    }
+
+    private void bindGlobal(KeyStroke stroke, String name, Runnable action) {
+        bindTo(getInputMap(WHEN_IN_FOCUSED_WINDOW), stroke, name, action);
+    }
+
+    private void bindTo(javax.swing.InputMap inputMap, KeyStroke stroke, String name, Runnable action) {
+        inputMap.put(stroke, name);
+        getActionMap().put(name, new AbstractAction() {
             @Override
             public void actionPerformed(ActionEvent e) {
-                spaceDown = false;
-                updateCursor();
+                action.run();
             }
         });
     }
 
     private record PortHit(Gate gate, int index, boolean output) {
+    }
+
+    private record Clipboard(List<CircuitState.GateState> gates, List<Wire> wires) {
     }
 }

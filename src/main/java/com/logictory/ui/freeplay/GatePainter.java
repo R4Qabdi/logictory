@@ -30,6 +30,9 @@ public final class GatePainter {
     private static final Color OUTPUT_BODY = new Color(0x352c27);
     private static final Color OUTPUT_BORDER = new Color(0x7a5a4c);
     private static final Color LED_OFF = new Color(0x4b4f5c);
+    private static final Color SHADOW = new Color(0, 0, 0, 90);
+    private static final Font LABEL_FONT = new Font("SansSerif", Font.BOLD, 15);
+    private static final Font ICON_FONT = new Font("SansSerif", Font.BOLD, 11);
 
     private GatePainter() {
     }
@@ -40,7 +43,7 @@ public final class GatePainter {
         int w = Gate.WIDTH;
         int h = Gate.HEIGHT;
 
-        g2.setColor(new Color(0, 0, 0, 90));
+        g2.setColor(SHADOW);
         g2.fillRoundRect(x + 3, y + 4, w, h, 14, 14);
 
         g2.setColor(bodyColor(gate.type()));
@@ -103,7 +106,7 @@ public final class GatePainter {
         g2.drawRoundRect(x, y, w, h, 10, 10);
 
         g2.setColor(TEXT);
-        g2.setFont(new Font("SansSerif", Font.BOLD, 11));
+        g2.setFont(ICON_FONT);
         FontMetrics fm = g2.getFontMetrics();
         String label = type.label();
         g2.drawString(label, x + (w - fm.stringWidth(label)) / 2,
@@ -112,7 +115,7 @@ public final class GatePainter {
 
     private static void drawLabel(Graphics2D g2, GateType type, int x, int y) {
         g2.setColor(TEXT);
-        g2.setFont(new Font("SansSerif", Font.BOLD, 15));
+        g2.setFont(LABEL_FONT);
         FontMetrics fm = g2.getFontMetrics();
         String label = type.label();
         int tx = x + (Gate.WIDTH - fm.stringWidth(label)) / 2;

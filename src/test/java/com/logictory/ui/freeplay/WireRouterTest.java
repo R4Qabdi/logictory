@@ -95,4 +95,26 @@ class WireRouterTest {
                 new java.awt.geom.Point2D.Double(200, 100));
         assertNotNull(preview);
     }
+
+    @Test
+    void fastModeKeepsPathsAndHitShapesButSkipsCrossingAnalysis() {
+        Circuit circuit = new Circuit();
+        Gate in1 = circuit.addGate(GateType.INPUT, 0, 0);
+        Gate in2 = circuit.addGate(GateType.INPUT, 0, 200);
+        Gate out1 = circuit.addGate(GateType.OUTPUT, 400, 100);
+        Gate out2 = circuit.addGate(GateType.OUTPUT, 500, 0);
+        circuit.connect(in1.id(), out1.id(), 0);
+        circuit.connect(in2.id(), out2.id(), 0);
+        Wire second = circuit.wires().get(1);
+
+        WireRouter router = new WireRouter(circuit);
+        router.setFastMode(true);
+
+        assertNotNull(router.pathFor(second));
+        assertTrue(router.intersects(second, new java.awt.geom.Rectangle2D.Double(0, 0, 1000, 1000)));
+        assertEquals(0, router.hopCount(second));
+
+        router.setFastMode(false);
+        assertTrue(router.hopCount(second) > 0);
+    }
 }

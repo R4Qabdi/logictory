@@ -2,16 +2,20 @@ package com.logictory.game;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public final class Circuit {
     private final List<Gate> gates = new ArrayList<>();
+    private final Map<Integer, Gate> gatesById = new HashMap<>();
     private final List<Wire> wires = new ArrayList<>();
     private int nextId = 1;
 
     public Gate addGate(GateType type, int x, int y) {
         Gate gate = new Gate(nextId++, type, x, y);
         gates.add(gate);
+        gatesById.put(gate.id(), gate);
         return gate;
     }
 
@@ -24,12 +28,7 @@ public final class Circuit {
     }
 
     public Gate gate(int id) {
-        for (Gate gate : gates) {
-            if (gate.id() == id) {
-                return gate;
-            }
-        }
-        return null;
+        return gatesById.get(id);
     }
 
     public void bringToFront(Gate gate) {
@@ -40,6 +39,7 @@ public final class Circuit {
 
     public void removeGate(Gate gate) {
         gates.remove(gate);
+        gatesById.remove(gate.id());
         wires.removeIf(w -> w.sourceId() == gate.id() || w.targetId() == gate.id());
     }
 
@@ -79,7 +79,33 @@ public final class Circuit {
 
     public void clear() {
         gates.clear();
+        gatesById.clear();
         wires.clear();
         nextId = 1;
+    }
+
+    /** Captures the complete editable state of this circuit. */
+    public CircuitState snapshot() {
+        List<CircuitState.GateState> gateStates = new ArrayList<>(gates.size());
+        for (Gate gate : gates) {
+            gateStates.add(new CircuitState.GateState(
+                    gate.id(), gate.type(), gate.x(), gate.y(), gate.output()));
+        }
+        return new CircuitState(gateStates, wires, nextId);
+    }
+
+    /** Replaces the circuit with a previously captured snapshot. */
+    public void restore(CircuitState state) {
+        gates.clear();
+        gatesById.clear();
+        wires.clear();
+        for (CircuitState.GateState gateState : state.gates()) {
+            Gate gate = new Gate(gateState.id(), gateState.type(), gateState.x(), gateState.y());
+            gate.setOutput(gateState.output());
+            gates.add(gate);
+            gatesById.put(gate.id(), gate);
+        }
+        wires.addAll(state.wires());
+        nextId = state.nextId();
     }
 }
