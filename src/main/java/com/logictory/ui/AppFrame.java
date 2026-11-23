@@ -14,6 +14,7 @@ import java.awt.Toolkit;
 /** The single application window; the menu and freeplay board are cards inside it. */
 public final class AppFrame extends JFrame {
     private static final String MENU = "menu";
+    private static final String LEVEL_SELECT = "level-select";
     private static final String FREEPLAY = "freeplay";
 
     private final CardLayout cards = new CardLayout();
@@ -33,11 +34,14 @@ public final class AppFrame extends JFrame {
         setLocationRelativeTo(null);
 
         MainMenuPanel menu = new MainMenuPanel(session, this::showFreeplay, this::setSession,
+            this::showLevelSelect,
                 () -> showFreeplay(SchematicsDialog.SAVED_TAB),
                 () -> showFreeplay(SchematicsDialog.ONLINE_TAB));
+        LocalLevelSelectPanel levelSelect = new LocalLevelSelectPanel(this::showMenu);
         freeplay = new FreeplayPanel(this::showMenu, () -> this.session);
 
         root.add(menu, MENU);
+        root.add(levelSelect, LEVEL_SELECT);
         root.add(freeplay, FREEPLAY);
         setContentPane(root);
         showMenu();
@@ -51,6 +55,12 @@ public final class AppFrame extends JFrame {
         setTitle("Logictory - Main Menu");
         setJMenuBar(null);
         cards.show(root, MENU);
+    }
+
+    public void showLevelSelect() {
+        setTitle("Logictory - Local Campaign");
+        setJMenuBar(null);
+        cards.show(root, LEVEL_SELECT);
     }
 
     public void showFreeplay() {

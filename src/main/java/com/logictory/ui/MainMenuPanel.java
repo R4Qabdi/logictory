@@ -4,7 +4,6 @@ import com.logictory.auth.UserSession;
 
 import javax.swing.JButton;
 import javax.swing.JLabel;
-import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
@@ -22,6 +21,7 @@ import java.util.function.Consumer;
 public final class MainMenuPanel extends JPanel {
     private final Runnable onFreeplay;
     private final Consumer<UserSession> onSessionChanged;
+    private final Runnable onLocalLevels;
     private final Runnable onSavedSchematics;
     private final Runnable onOnlineLevels;
     private UserSession session;
@@ -36,9 +36,15 @@ public final class MainMenuPanel extends JPanel {
 
     public MainMenuPanel(UserSession session, Runnable onFreeplay, Consumer<UserSession> onSessionChanged,
                          Runnable onSavedSchematics, Runnable onOnlineLevels) {
+        this(session, onFreeplay, onSessionChanged, null, onSavedSchematics, onOnlineLevels);
+    }
+
+    public MainMenuPanel(UserSession session, Runnable onFreeplay, Consumer<UserSession> onSessionChanged,
+                         Runnable onLocalLevels, Runnable onSavedSchematics, Runnable onOnlineLevels) {
         this.session = session;
         this.onFreeplay = onFreeplay;
         this.onSessionChanged = onSessionChanged;
+        this.onLocalLevels = onLocalLevels;
         this.onSavedSchematics = onSavedSchematics;
         this.onOnlineLevels = onOnlineLevels;
 
@@ -79,12 +85,11 @@ public final class MainMenuPanel extends JPanel {
 
         JButton playLocalBtn = new JButton("Play Local Campaign");
         playLocalBtn.setFont(playLocalBtn.getFont().deriveFont(Font.BOLD, 15f));
-        playLocalBtn.addActionListener(e -> JOptionPane.showMessageDialog(
-                this,
-                "Local Campaign / Level Select coming next!",
-                "Play Local",
-                JOptionPane.INFORMATION_MESSAGE
-        ));
+        playLocalBtn.addActionListener(e -> {
+            if (onLocalLevels != null) {
+                onLocalLevels.run();
+            }
+        });
 
         JButton freeplayBtn = new JButton("Freeplay (Sandbox)");
         freeplayBtn.setFont(freeplayBtn.getFont().deriveFont(Font.BOLD, 15f));

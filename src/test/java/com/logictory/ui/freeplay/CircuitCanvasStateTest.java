@@ -87,4 +87,25 @@ class CircuitCanvasStateTest {
             assertTrue(canvas.hasClipboard());
         });
     }
+
+    @Test
+    void copiedGatesArePastedCenteredAtTheCursor() throws Exception {
+        SwingUtilities.invokeAndWait(() -> {
+            Circuit source = new Circuit();
+            Gate input = source.addGate(GateType.INPUT, 0, 0);
+            Gate output = source.addGate(GateType.OUTPUT, 200, 0);
+            source.connect(input.id(), output.id(), 0);
+            Circuit target = new Circuit();
+            CircuitCanvas canvas = new CircuitCanvas(target);
+
+            canvas.copyState(source.snapshot());
+            canvas.pasteClipboardAt(new java.awt.geom.Point2D.Double(300, 225));
+
+            assertEquals(2, target.gates().size());
+            assertEquals(160, target.gates().get(0).x());
+            assertEquals(200, target.gates().get(0).y());
+            assertEquals(360, target.gates().get(1).x());
+            assertEquals(1, target.wires().size());
+        });
+    }
 }

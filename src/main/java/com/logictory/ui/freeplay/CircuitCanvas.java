@@ -95,6 +95,7 @@ public final class CircuitCanvas extends JPanel {
 
     private GateType ghostType;
     private Point2D ghostPoint;
+    private Point2D cursorWorld;
 
     private boolean panning;
     private Point panAnchor;
@@ -485,14 +486,37 @@ public final class CircuitCanvas extends JPanel {
         if (!hasClipboard()) {
             return;
         }
+        pasteClipboardAt(cursorWorld);
+    }
+
+    void pasteClipboardAt(Point2D cursor) {
         beginMutation();
         clearSelection();
-        int offset = PASTE_OFFSET * ++pasteSerial;
+        double offsetX;
+        double offsetY;
+        if (cursor == null) {
+            int offset = PASTE_OFFSET * ++pasteSerial;
+            offsetX = offset;
+            offsetY = offset;
+        } else {
+            double minX = Double.MAX_VALUE;
+            double minY = Double.MAX_VALUE;
+            double maxX = -Double.MAX_VALUE;
+            double maxY = -Double.MAX_VALUE;
+            for (CircuitState.GateState gateState : clipboard.gates()) {
+                minX = Math.min(minX, gateState.x());
+                minY = Math.min(minY, gateState.y());
+                maxX = Math.max(maxX, gateState.x() + Gate.WIDTH);
+                maxY = Math.max(maxY, gateState.y() + Gate.HEIGHT);
+            }
+            offsetX = cursor.getX() - (minX + maxX) / 2.0;
+            offsetY = cursor.getY() - (minY + maxY) / 2.0;
+        }
         Map<Integer, Gate> remapped = new HashMap<>();
         for (CircuitState.GateState gateState : clipboard.gates()) {
             Gate gate = circuit.addGate(gateState.type(),
-                    snap(gateState.x() + offset),
-                    snap(gateState.y() + offset));
+                    snap((int) Math.round(gateState.x() + offsetX)),
+                    snap((int) Math.round(gateState.y() + offsetY)));
             gate.setOutput(gateState.output());
             remapped.put(gateState.id(), gate);
             selectedGates.add(gate);
@@ -515,6 +539,7 @@ public final class CircuitCanvas extends JPanel {
     private void handlePressed(MouseEvent e) {
         requestFocusInWindow();
         Point p = e.getPoint();
+        cursorWorld = screenToWorld(p);
 
         if (SwingUtilities.isMiddleMouseButton(e) || (spaceDown && SwingUtilities.isLeftMouseButton(e))) {
             autoFit = false;
@@ -617,11 +642,13 @@ public final class CircuitCanvas extends JPanel {
         if (panning) {
             panX = panStartX + (e.getX() - panAnchor.x);
             panY = panStartY + (e.getY() - panAnchor.y);
+            cursorWorld = screenToWorld(e.getPoint());
             repaint();
             return;
         }
 
         Point2D world = screenToWorld(e.getPoint());
+        cursorWorld = world;
         if (draggingGate != null && dragStartWorld != null) {
             int dx = snap((int) Math.round(world.getX() - dragStartWorld.getX()));
             int dy = snap((int) Math.round(world.getY() - dragStartWorld.getY()));
@@ -658,6 +685,7 @@ public final class CircuitCanvas extends JPanel {
     }
 
     private void handleReleased(MouseEvent e) {
+        cursorWorld = screenToWorld(e.getPoint());
         if (panning) {
             panning = false;
             updateCursor();
@@ -714,6 +742,7 @@ public final class CircuitCanvas extends JPanel {
 
     private void handleMoved(MouseEvent e) {
         Point2D world = screenToWorld(e.getPoint());
+        cursorWorld = world;
         PortHit port = findPort(world);
         Gate newGate = port == null ? null : port.gate();
         int newInput = port == null || port.output() ? -1 : port.index();
